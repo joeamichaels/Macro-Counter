@@ -237,6 +237,131 @@ function App() {
     saveLS("md-custom-foods", all.filter(f=>f.custom));
   };
 
+  const [suggestions, setSuggestions] = useState(null);
+
+  // Infer food role from macro profile
+  const roleOf = (f) => {
+    const calPer = f.cal / (f.mode === "g" ? f.base / 100 : 1); // rough density
+    const pCal = f.p * 4, cCal = f.c * 4, fCal = f.f * 9;
+    const tot = Math.max(pCal + cCal + fCal, 1);
+    if (f.mode === "g" && f.cal / f.base <= 0.5) return "veg"; // <50 cal/100g
+    if (pCal / tot >= 0.5) return "protein";
+    if (fCal / tot >= 0.5) return "fat";
+    if (cCal / tot >= 0.55) return "carb";
+    return "mixed";
+  };
+
+  const scoreLeft = (left) => {
+    const pen = (v, w) => (v < 0 ? 3 * Math.abs(v) : v) * w;
+    return pen(left.cal, 1/50) + pen(left.p, 1/4) + pen(left.c, 1/5) + pen(left.f, 1/2.5);
+  };
+
+  const bestPortion = (food, rem, calCap) => {
+    let best = null;
+    const scales = [];
+    if (food.mode === "g") { for (let g = 10; g <= 450; g += 5) scales.push(g / food.base); }
+    else { for (let u = 0.25; u <= 4.001; u += 0.25) scales.push(u / food.base); }
+    for (const s of scales) {
+      const c = { cal: food.cal*s, p: food.p*s, c: food.c*s, f: food.f*s };
+      if (c.cal > calCap) continue;
+      const left = { cal: rem.cal-c.cal, p: rem.p-c.p, c: rem.c-c.c, f: rem.f-c.f };
+      const sc = scoreLeft(left);
+      if (!best || sc < best.sc) best = { sc, s, contrib: c };
+    }
+    return best;
+  };
+
+  const fmtAmt = (food, s) => food.mode === "g" ? Math.round(s*food.base) + "g" : (Math.round(s*food.base*4)/4) + " " + food.unitLabel;
+
+  const suggestFillers = () => {
+    const rem = {
+      cal: target.cal - totals.cal,
+      p: target.p - totals.p,
+      c: target.c - totals.c,
+      f: target.f - totals.f,
+    };
+    if (rem.cal <= 50) { setSuggestions({ singles: [], combos: [] }); return; }
+
+    // ---- Singles ----
+    const singles = [];
+    for (const food of foods) {
+      const b = bestPortion(food, rem, rem.cal + 60);
+      if (b) singles.push({ food, ...b });
+    }
+    singles.sort((a,b) => a.sc - b.sc);
+    const topSingles = singles.slice(0, 4).map(r => ({
+      items: [{ name: r.food.name, amt: fmtAmt(r.food, r.s), foodRef: r.food, amount: r.food.mode==="g"?Math.round(r.s*r.food.base):Math.round(r.s*r.food.base*4)/4 }],
+      cal: r1(r.contrib.cal), p: r1(r.contrib.p), c: r1(r.contrib.c), f: r1(r.contrib.f),
+    }));
+
+    // ---- Combos (meal-sized gaps only) ----
+    let combos = [];
+    if (rem.cal >= 400) {
+      const proteins = foods.filter(f => roleOf(f) === "protein").slice(0, 14);
+      const carbs = foods.filter(f => roleOf(f) === "carb").slice(0, 10);
+      const vegsFats = foods.filter(f => { const r = roleOf(f); return r === "veg" || r === "fat"; }).slice(0, 12);
+      const comboResults = [];
+      for (const P of proteins) for (const C of carbs) for (const V of vegsFats) {
+        // Sequential greedy portioning: protein first vs P gap, then carb vs C gap, then veg/fat vs remainder
+        let working = { ...rem };
+        const bp = bestPortion(P, { cal: working.cal, p: working.p, c: 0, f: 0 }, working.cal * 0.65);
+        if (!bp) continue;
+        working = { cal: working.cal-bp.contrib.cal, p: working.p-bp.contrib.p, c: working.c-bp.contrib.c, f: working.f-bp.contrib.f };
+        const bc = bestPortion(C, { cal: working.cal, p: 0, c: working.c, f: 0 }, Math.max(working.cal, 0));
+        if (!bc) continue;
+        working = { cal: working.cal-bc.contrib.cal, p: working.p-bc.contrib.p, c: working.c-bc.contrib.c, f: working.f-bc.contrib.f };
+        const bv = bestPortion(V, working, Math.max(working.cal + 40, 0));
+        if (!bv) continue;
+        const final = { cal: working.cal-bv.contrib.cal, p: working.p-bv.contrib.p, c: working.c-bv.contrib.c, f: working.f-bv.contrib.f };
+        comboResults.push({
+          sc: scoreLeft(final),
+          parts: [
+            { food: P, s: bp.s, contrib: bp.contrib },
+            { food: C, s: bc.s, contrib: bc.contrib },
+            { food: V, s: bv.s, contrib: bv.contrib },
+          ],
+        });
+      }
+      comboResults.sort((a,b) => a.sc - b.sc);
+      // de-duplicate by protein+carb pair
+      const seen = new Set();
+      combos = [];
+      for (const r of comboResults) {
+        const key = r.parts[0].food.name + "|" + r.parts[1].food.name;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const tot = r.parts.reduce((a,p)=>({cal:a.cal+p.contrib.cal,p:a.p+p.contrib.p,c:a.c+p.contrib.c,f:a.f+p.contrib.f}),{cal:0,p:0,c:0,f:0});
+        combos.push({
+          items: r.parts.map(p => ({ name: p.food.name, amt: fmtAmt(p.food, p.s), foodRef: p.food, amount: p.food.mode==="g"?Math.round(p.s*p.food.base):Math.round(p.s*p.food.base*4)/4 })),
+          cal: r1(tot.cal), p: r1(tot.p), c: r1(tot.c), f: r1(tot.f),
+        });
+        if (combos.length >= 3) break;
+      }
+    }
+    setSuggestions({ singles: topSingles, combos });
+  };
+
+  const applySuggestionItem = (it) => {
+    setSel(it.foodRef);
+    setQuery(it.foodRef.name);
+    setAmount(String(it.amount));
+  };
+
+  const logWholeCombo = (sug) => {
+    const entries = sug.items.map((it, idx) => {
+      const f = it.foodRef;
+      const ratio = it.amount / f.base;
+      return {
+        id: Date.now() + idx, meal,
+        name: f.name, amount: it.amount,
+        unit: f.mode === "g" ? "g" : f.unitLabel,
+        cal: r1(f.cal*ratio), p: r1(f.p*ratio), c: r1(f.c*ratio), f: r1(f.f*ratio),
+      };
+    });
+    updateLog({ ...log, [dayKey]: { ...dayData, entries: [...dayData.entries, ...entries] } });
+    setSuggestions(null);
+  };
+
   useEffect(() => saveLS("md-week", week), [week]);
   useEffect(() => saveLS("md-day", day), [day]);
 
@@ -311,7 +436,25 @@ function App() {
       h(Bar, { label: "Calories", val: totals.cal, max: target.cal, unit: "" }),
       h(Bar, { label: "Protein", val: totals.p, max: target.p, unit: "g" }),
       h(Bar, { label: "Carbs", val: totals.c, max: target.c, unit: "g" }),
-      h(Bar, { label: "Fat", val: totals.f, max: target.f, unit: "g" })),
+      h(Bar, { label: "Fat", val: totals.f, max: target.f, unit: "g" }),
+      h("button", { className: "ghost-btn", style: { width: "100%", marginTop: 4 }, onClick: suggestFillers }, "Suggest Gap Fillers"),
+      suggestions && suggestions.singles.length === 0 && suggestions.combos.length === 0 && h("div", { style: { fontSize: 13, color: "var(--dim)", marginTop: 10, textAlign: "center" } }, "Under 50 cal remaining — day is essentially closed."),
+      suggestions && suggestions.combos.length > 0 && h("div", { style: { marginTop: 12 } },
+        h("div", { style: { fontSize: 11, color: "var(--dim)", textTransform: "uppercase", letterSpacing: ".08em", marginBottom: 6 } }, "Meal Combos · protein + carb + veg/fat · tap item to prefill, or log all"),
+        suggestions.combos.map((s, i) =>
+          h("div", { key: "c"+i, style: { border: "1px solid var(--border2)", borderRadius: 8, padding: "10px 12px", marginBottom: 8 } },
+            s.items.map((it, j) =>
+              h("div", { key: j, onClick: () => applySuggestionItem(it), style: { fontSize: 13, padding: "3px 0", cursor: "pointer" } },
+                it.name + " ", h("span", { className: "amt" }, it.amt))),
+            h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 6, paddingTop: 6, borderTop: "1px solid var(--border2)" } },
+              h("span", { className: "num", style: { fontSize: 12, color: "var(--muted)" } }, `${s.cal} · ${s.p}P · ${s.c}C · ${s.f}F`),
+              h("button", { className: "ghost-btn on", style: { padding: "4px 10px", fontSize: 12 }, onClick: () => logWholeCombo(s) }, "Log all"))))),
+      suggestions && suggestions.singles.length > 0 && h("div", { style: { marginTop: 12 } },
+        h("div", { style: { fontSize: 11, color: "var(--dim)", textTransform: "uppercase", letterSpacing: ".08em", marginBottom: 6 } }, "Single Fillers · tap to prefill"),
+        suggestions.singles.map((s, i) =>
+          h("div", { key: "s"+i, onClick: () => applySuggestionItem(s.items[0]), className: "entry", style: { cursor: "pointer" } },
+            h("span", null, s.items[0].name + " ", h("span", { className: "amt" }, s.items[0].amt)),
+            h("span", { className: "macros num" }, `${s.cal} · ${s.p}P · ${s.c}C · ${s.f}F`))))),
 
     h("div", { className: "card" },
       h("div", { className: "section-title" }, "Log Food"),
